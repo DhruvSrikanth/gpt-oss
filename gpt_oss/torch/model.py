@@ -42,8 +42,17 @@ class RMSNorm(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.shape[-1] == self.num_features
+        # x.float() -> convert to float32
+        # see: https://docs.pytorch.org/docs/stable/generated/torch.Tensor.float.html
+        # this is important as x.dtype is bfloat16
+        # we use float32 since summing the squares of a large number of small values in t can
+        # lead to rounding errors in the normalization computation and
+        # to avoid underflow in rsqrt and
+        # to ensure we don't lose precision when using rsqrt
+        # this is also why eps is added to the mean of the squares of t before rsqrt
         t, dtype = x.float(), x.dtype
         t = t * torch.rsqrt(torch.mean(t**2, dim=-1, keepdim=True) + self.eps)
+        # we cast back to bfloat16 which is the dtype of x after the normalization
         return (t * self.scale).to(dtype)
 
 
@@ -361,6 +370,9 @@ class Transformer(torch.nn.Module):
         device: torch.device | None = None,
     ):
         super().__init__()
+        # we use bfloat16 in all layers except the RMSNorm normalization layer
+        # which uses float32 for efficiency purposes
+        # see RMSNorm.forward() for why float32 is used
         self.embedding = torch.nn.Embedding(
             config.vocab_size, config.hidden_size, device=device, dtype=torch.bfloat16
         )
@@ -447,6 +459,11 @@ class TokenGenerator:
         self.device = device
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
 
+    # torch.inference_mode() -> disables gradient computation and sets model to eval mode
+    # this is preferred over using model.eval() and with torch.no_grad()
+    # in the newer versions of torch, inference_mode() is the preferred way to do this
+    # as you can rely on RunTimeError if you try to use a model in training mode e.g.,
+    # see: https://discuss.pytorch.org/t/pytorch-torch-no-grad-vs-torch-inference-mode/134099
     @torch.inference_mode()
     def generate(self,
                  prompt_tokens: list[int],
@@ -454,11 +471,15 @@ class TokenGenerator:
                  temperature: float = 1.0,
                  max_tokens: int = 0,
                  return_logprobs: bool = False):
+        # function returns a generator -> used for streaming
         tokens = list(prompt_tokens)
         num_generated_tokens = 0
+        # max_tokens == 0 -> generate forever
         while max_tokens == 0 or num_generated_tokens < max_tokens:
+            # use as_tensor to avoid copying data if possible
             logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
             if temperature == 0.0:
+                # temp = 0 -> greedy decoding
                 predicted_token = torch.argmax(logits, dim=-1).item()
             else:
                 probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
@@ -467,6 +488,12 @@ class TokenGenerator:
             num_generated_tokens += 1
 
             if return_logprobs:
+                # logprobs are returned as opposed to probs for numerical stability
+                # imagine a list of 1000 tokens, each with a probability of 0.001
+                # the probability of the sequence will be the product of the token probabilities
+                # this can lead to underflow, so we use log probs instead
+                # note that with log probs, the log prob of the sequence is the sum
+                # (instead of product) of the token log probs
                 logprobs = torch.log_softmax(logits, dim=-1)
                 selected_logprobs = logprobs[predicted_token].item()
                 yield predicted_token, selected_logprobs
