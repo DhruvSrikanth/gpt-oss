@@ -415,23 +415,32 @@ class Transformer(torch.nn.Module):
             config=config,
             device=device,
         )
+        # since torch.inference_mode() only disables some autograd functionality
+        # like gradient computation, we also want to set the model to eval mode
         model.eval()
 
         # Load weights
         my_rank = dist.get_rank() if dist.is_initialized() else 0
         world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # world_size is the number of gpus present
         per_rank_intermediate_size = config.intermediate_size // world_size
+        # this allows us the shard each MLPBlock (MOE layers) across the gpus since it is very large
+        # this is tensor parallelism
+        # as shown in the loop below, no sharding is done for the other layers (attention, norm, etc.)
 
         checkpoint = Checkpoint(path, device)
 
         for name, param in model.named_parameters():
+            # this function loads the MOE weights in the MXFP4 format and upcasts them to bfloat16
+            # the other weights (MOE biases and other weights) are stored in their native format (bfloat16)
+            # and are loaded as is
             loaded_tensor = checkpoint.get(name)
 
             # Note: it would be more efficient to do sharding before upcasting from MXFP4,
             # but for simplicity we do it after.
             if "mlp1" in name:  # both weight and bias
                 loaded_tensor = loaded_tensor[
-                    :,
+                    :,  # this is for the experts and the sharding in within each expert, so each gpu gets a slice of all experts
                     my_rank * 2
                     * per_rank_intermediate_size : (my_rank + 1) * 2
                     * per_rank_intermediate_size,
@@ -460,7 +469,7 @@ class TokenGenerator:
         self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
 
     # torch.inference_mode() -> disables gradient computation and sets model to eval mode
-    # this is preferred over using model.eval() and with torch.no_grad()
+    # this is preferred over using torch.no_grad() as the context manager
     # in the newer versions of torch, inference_mode() is the preferred way to do this
     # as you can rely on RunTimeError if you try to use a model in training mode e.g.,
     # see: https://discuss.pytorch.org/t/pytorch-torch-no-grad-vs-torch-inference-mode/134099

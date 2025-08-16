@@ -53,6 +53,7 @@ class Checkpoint:
         match PARAM_NAME_MAP.get(name, name):
             case (blocks_name, scales_name):
                 # MoE weights: are in block-based MXFP4 format
+                # these are the really large weights which is why they are stored in the MXFP4 format
                 return self._get_mxfp4_tensor(blocks_name, scales_name, dtype=torch.bfloat16)
             case tensor_name:
                 # MoE biases and other weights
